@@ -1,0 +1,183 @@
+name: Sync upstream, build and release Lockpick RCM
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/upstream-sync-release.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: lockpick-rcm-sync-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync impeeza upstream branches
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      any_changed: ${{ steps.sync.outputs.any_changed }}
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - name: Sync dev, master and impeeza-BTH-Rewrite
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/impeeza/Lockpick_RCMDecScots.git
+          git fetch upstream dev master impeeza-BTH-Rewrite --no-tags
+          git fetch origin dev master impeeza-BTH-Rewrite --no-tags
+          any_changed=false
+
+          for branch in dev master impeeza-BTH-Rewrite; do
+            git checkout -B "$branch" "refs/remotes/origin/$branch"
+            if git merge-base --is-ancestor "refs/remotes/upstream/$branch" HEAD; then
+              echo "$branch: already up-to-date"
+              continue
+            fi
+            if [ "$branch" = dev ]; then
+              # Keep custom automation commits on the default branch.
+              git merge --no-edit "refs/remotes/upstream/$branch"
+            else
+              # Do not overwrite local branch edits or divergent histories.
+              if ! git merge-base --is-ancestor HEAD "refs/remotes/upstream/$branch"; then
+                echo "$branch diverged. Refusing to force push." >&2
+                exit 1
+              fi
+              git merge --ff-only "refs/remotes/upstream/$branch"
+            fi
+            git push origin "HEAD:refs/heads/$branch"
+            any_changed=true
+            echo "$branch: updated"
+          done
+          echo "any_changed=$any_changed" >> "$GITHUB_OUTPUT"
+
+  build-release:
+    name: Build and release (${{ matrix.branch }})
+    needs: sync
+    if: ${{ needs.sync.outputs.any_changed == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkitarm:20260610
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: [dev, master, impeeza-BTH-Rewrite]
+    steps:
+      - name: Checkout synced source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
+          persist-credentials: false
+
+      - name: Check existing Release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH_NAME: ${{ matrix.branch }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          tag="${BRANCH_NAME}-${sha:0:12}"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          status="$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$tag")"
+          case "$status" in
+            200)
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              echo "Release $tag already exists; no rebuild needed."
+              ;;
+            404) echo "exists=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "GitHub Release API returned HTTP $status" >&2; exit 1 ;;
+          esac
+
+      - name: Verify devkitARM installation
+        if: steps.release.outputs.exists == 'false'
+        run: |
+          test -f "$DEVKITARM/base_rules"
+          command -v make
+          command -v gcc
+          command -v zip
+          "$DEVKITARM/bin/arm-none-eabi-gcc" --version | head -n 1
+
+      - name: Build payload
+        if: steps.release.outputs.exists == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -j2
+          test -s output/Lockpick_RCM.bin
+          payload_size="$(wc -c < output/Lockpick_RCM.bin)"
+          echo "Payload size: $payload_size bytes"
+          if [ "$payload_size" -gt 126296 ]; then
+            echo "RCM payload exceeds 126296-byte size limit" >&2
+            exit 1
+          fi
+
+      - name: Package raw payload and Hekate ZIP
+        if: steps.release.outputs.exists == 'false'
+        id: package
+        shell: bash
+        env:
+          BRANCH_NAME: ${{ matrix.branch }}
+          SOURCE_SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          set -euo pipefail
+          short_sha="${SOURCE_SHA:0:12}"
+          prefix="Lockpick_RCM-${BRANCH_NAME}-${short_sha}"
+          mkdir -p dist/hekatestage/bootloader/payloads
+          cp output/Lockpick_RCM.bin "dist/${prefix}.bin"
+          cp output/Lockpick_RCM.bin dist/hekatestage/bootloader/payloads/Lockpick_RCM.bin
+          (cd output && zip -q -9 "../dist/${prefix}.zip" Lockpick_RCM.bin)
+          (cd dist/hekatestage && zip -q -9 -r "../${prefix}-Hekate.zip" bootloader)
+          rm -rf dist/hekatestage
+          {
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Upstream: impeeza/Lockpick_RCMDecScots"
+            echo "Branch: $BRANCH_NAME"
+            echo "Commit: $SOURCE_SHA"
+            echo "Toolchain image: devkitpro/devkitarm:20260610"
+            echo "Payload bytes: $(wc -c < output/Lockpick_RCM.bin)"
+            echo "Built at UTC: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } > dist/BUILD-INFO.txt
+          (cd dist && sha256sum ./*.bin ./*.zip BUILD-INFO.txt > SHA256SUMS)
+          (cd dist && sha256sum -c SHA256SUMS)
+
+      - name: Publish GitHub Release
+        if: steps.release.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          target_commitish: ${{ matrix.branch }}
+          name: Lockpick RCM ${{ matrix.branch }} @ ${{ steps.release.outputs.tag }}
+          body: |
+            Automated build from `969981/Lockpick_RCMDecScots`, tracking `impeeza/Lockpick_RCMDecScots`.
+            Branch: `${{ matrix.branch }}`
+            Source commit: `${{ steps.release.outputs.sha }}`
+            Toolchain: `devkitpro/devkitarm:20260610`
+            Artifacts: raw RCM .bin, flat ZIP, Hekate-compatible ZIP, build metadata and SHA256 checksums.
+            This release contains no console-specific keys. Build success does not establish hardware compatibility.
+          files: |
+            dist/*.bin
+            dist/*.zip
+            dist/BUILD-INFO.txt
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
