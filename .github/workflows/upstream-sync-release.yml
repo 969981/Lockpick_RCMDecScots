@@ -92,6 +92,7 @@ jobs:
           BRANCH_NAME: ${{ matrix.branch }}
         run: |
           set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           sha="$(git rev-parse HEAD)"
           tag="${BRANCH_NAME}-${sha:0:12}"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
